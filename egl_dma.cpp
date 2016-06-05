@@ -11,6 +11,9 @@
 #include <EGL/eglext.h>
 #include <linux/videodev2.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
+
+#include <libdrm/drm_fourcc.h>
 
 #define WIDTH 1920
 #define HEIGHT 1080
@@ -58,12 +61,12 @@ enum ion_heap_type
 #define ION_HEAP_SYSTEM_CONTIG_MASK (1 << ION_HEAP_TYPE_SYSTEM_CONTIG)
 #define ION_HEAP_CARVEOUT_MASK      (1 << ION_HEAP_TYPE_CARVEOUT)
 
+
 int main(int argc, char *argv[])
 {
     int v4l2_dev = -1, ion_dev = -1, dma_fd = -1;
 
     size_t len = 1920*1080*4;
-
 
     if (!(ion_dev = open("/dev/ion", O_RDWR)))
     {
@@ -97,6 +100,8 @@ int main(int argc, char *argv[])
       return -1;
     }
     dma_fd = dma_data.fd;
+    void* dma_ptr = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, dma_fd, 0);
+    printf("Successfully retrieved DMA (fd:%d, ptr:%X)\n", dma_fd, (unsigned int)dma_ptr);
 
     /*
     if (!(v4l2_dev = open("/dev/video13", O_RDWR | O_NONBLOCK)))
@@ -183,10 +188,10 @@ int main(int argc, char *argv[])
         eglCreateImageKHRfn eglCreateImageKHR = (eglCreateImageKHRfn) (eglGetProcAddress("eglCreateImageKHR"));
 
         struct fbdev_dma_buf dma_buf;
-        memset(&dma_buf, 0, sizeof(struct fbdev_dma_buf));
+        memset(&dma_buf, 0, sizeof(dma_buf));
         dma_buf.fd = dma_fd;
         dma_buf.size = len;
-	dma_buf.ptr = 0;
+        dma_buf.ptr = dma_ptr;
 
         struct fbdev_pixmap pixmap;
         memset(&pixmap, 0, sizeof(struct fbdev_pixmap));
@@ -197,23 +202,52 @@ int main(int argc, char *argv[])
         pixmap.red_size = 8;
         pixmap.green_size = 8;
         pixmap.blue_size = 8;
-	pixmap.alpha_size = 8;
-        pixmap.flags = FBDEV_PIXMAP_DMA_BUF;
+        pixmap.alpha_size = 8;
+        pixmap.flags = (fbdev_pixmap_flags)(FBDEV_PIXMAP_SUPPORTS_UMP);
         pixmap.data = (short unsigned int*)(&dma_buf);
-	pixmap.format = 1;
 
-#ifdef SURFACE
+//#define DMAIMP
+#ifdef SURF
         EGLSurface surface = eglCreatePixmapSurface(display, config, (EGLNativePixmapType)&pixmap, NULL); 
         if (surface == EGL_NO_SURFACE) {
             printf("failed to create DMA surface %d\n",eglGetError());
             return -1;
         }
-#else
+#elif defined DMAIMP
+        static EGLenum EGL_LINUX_DMA_BUF_EXT  = 0x3270;
+        static EGLint EGL_LINUX_DRM_FOURCC_EXT = 0x3271;
+        static EGLint EGL_DMA_BUF_PLANE0_FD_EXT = 0x3272;
+        static EGLint EGL_DMA_BUF_PLANE0_OFFSET_EXT = 0x3273;
+        static EGLint EGL_DMA_BUF_PLANE0_PITCH_EXT = 0x3274;
 
+        EGLint img_attrs[] = {
+            EGL_WIDTH,
+            WIDTH,
+            EGL_HEIGHT,
+            HEIGHT,
+            EGL_LINUX_DRM_FOURCC_EXT,
+            DRM_FORMAT_XRGB8888,
+            EGL_DMA_BUF_PLANE0_FD_EXT,
+            dma_fd,
+            EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+            0,
+            EGL_DMA_BUF_PLANE0_PITCH_EXT,
+            0,
+            EGL_NONE
+        };
+
+        EGLImageKHR image = eglCreateImageKHR(display, context, EGL_LINUX_DMA_BUF_EXT, 0, img_attrs);
+
+        if (image == EGL_NO_IMAGE_KHR)
+        {
+                printf("failed to create DMA pixmap %X\n",eglGetError());
+                return -1;
+        }
+#else
         EGLImageKHR image  = eglCreateImageKHR(display, EGL_NO_CONTEXT, EGL_NATIVE_PIXMAP_KHR, (EGLNativePixmapType)&pixmap, NULL);
 
         if (image == EGL_NO_IMAGE_KHR) {
-                printf("failed to create DMA pixmap %x\n",eglGetError());
+                printf("failed to create DMA pixmap %X\n",eglGetError());
                 return -1;
         }
 #endif
