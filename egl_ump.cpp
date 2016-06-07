@@ -11,6 +11,9 @@
 #include <EGL/eglext.h>
 #include <linux/videodev2.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <ump/ump.h>
+
 
 #define WIDTH 1920
 #define HEIGHT 1080
@@ -19,12 +22,13 @@
 int main(int argc, char *argv[])
 {
     int v4l2_dev = -1, ump_sid = -1;
+    ump_handle umph;
 
     size_t len = 1920*1080*3;
 
-    if (!(v4l2_dev = open("/dev/video13", O_RDWR | O_NONBLOCK)))
+    if (!(v4l2_dev = open("/dev/video10", O_RDWR | O_NONBLOCK)))
     {
-        printf("Cannot open AML video device /dev/video10: %s", strerror(errno));
+        printf("Cannot open AML video device /dev/video10: %s\n", strerror(errno));
         return -1;
     }
 
@@ -36,7 +40,7 @@ int main(int argc, char *argv[])
 
     if (ioctl(v4l2_dev, VIDIOC_S_FMT, &fmt) < 0)
     {
-        printf("VIDIOC_S_FMT failed: %s", strerror(errno));
+        printf("VIDIOC_S_FMT failed: %s\n", strerror(errno));
         return -1;
     }
 
@@ -44,10 +48,40 @@ int main(int argc, char *argv[])
     req.count = 1;
     req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     req.memory = V4L2_MEMORY_MMAP;
-    if (ioctl(v4l2_dev, VIDIOC_REQBUFS, &req) < 0)
-    {
-        printf("VIDIOC_REQBUFS failed: %s", strerror(errno));
+    if (ioctl(v4l2_dev, VIDIOC_REQBUFS, &req) < 0) {
+        printf("VIDIOC_REQBUFS failed: %s\n", strerror(errno));
         return -1;
+    }
+
+    if(req.count != 1) {
+        printf("VIDIOC_REQBUFS returns no buffers\n");
+        return -1;
+    }
+
+
+    struct v4l2_buffer buffer;
+
+    memset(&buffer, 0, sizeof(buffer));
+    buffer.type = req.type;
+    buffer.memory = req.memory;
+    buffer.index = 0;
+
+    if (ioctl (v4l2_dev, VIDIOC_QUERYBUF, &buffer)) {
+      printf("VIDIOC_QUERYBUF failed\n");
+      return -1;
+    }
+
+    //Currently we need the mmap call as it alloates the  memory inside kernel driver
+    //TODO: allocate the physical adress space without mmapping stuff
+    size_t mem_size = buffer.length;
+    void *mem = mmap(NULL, buffer.length,
+      PROT_READ | PROT_WRITE, // recommended
+      MAP_SHARED,             // recommended
+      v4l2_dev, buffer.m.offset);
+
+    if (mem == MAP_FAILED) {
+      printf("mmap failed\n");
+      return -1;
     }
 
     struct v4l2_exportbuffer expbuf;
@@ -55,11 +89,14 @@ int main(int argc, char *argv[])
     expbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     expbuf.index = 0;
     if (ioctl(v4l2_dev, VIDIOC_EXPBUF, &expbuf) == -1) {
-        printf("VIDIOC_EXPBUF failed: %s", strerror(errno));
+        printf("VIDIOC_EXPBUF failed: %s\n", strerror(errno));
         return -1;
     }
 
+    ump_open();
     ump_sid = expbuf.fd;
+    umph = ump_handle_create_from_secure_id(ump_sid);
+    printf("UMP: secure%x, handle:%p, size:%lu\n", ump_sid, umph, ump_size_get(umph));
 
     /********************  EGL ***************** */
     {
@@ -114,12 +151,6 @@ int main(int argc, char *argv[])
         typedef EGLImageKHR (*eglCreateImageKHRfn)(EGLDisplay dpy, EGLContext ctx, EGLenum target, EGLClientBuffer buffer, const EGLint *attrib_list);
         eglCreateImageKHRfn eglCreateImageKHR = (eglCreateImageKHRfn) (eglGetProcAddress("eglCreateImageKHR"));
 
-        struct fbdev_dma_buf dma_buf;
-        memset(&dma_buf, 0, sizeof(struct fbdev_dma_buf));
-        dma_buf.fd = dma_fd;
-        dma_buf.size = len;
-	dma_buf.ptr = 0;
-
         struct fbdev_pixmap pixmap;
         memset(&pixmap, 0, sizeof(struct fbdev_pixmap));
         pixmap.width = WIDTH;
@@ -130,9 +161,9 @@ int main(int argc, char *argv[])
         pixmap.green_size = 8;
         pixmap.blue_size = 8;
 	pixmap.alpha_size = 8;
-        pixmap.flags = FBDEV_PIXMAP_DMA_BUF;
-        pixmap.data = (short unsigned int*)(&dma_buf);
-	pixmap.format = 1;
+        pixmap.flags = FBDEV_PIXMAP_SUPPORTS_UMP;
+        pixmap.data = (short unsigned int*)(umph);
+	pixmap.format = 0;
 
 #ifdef SURFACE
         EGLSurface surface = eglCreatePixmapSurface(display, config, (EGLNativePixmapType)&pixmap, NULL); 
@@ -141,15 +172,19 @@ int main(int argc, char *argv[])
             return -1;
         }
 #else
-
+        printf("EGLIMAGE\n");
         EGLImageKHR image  = eglCreateImageKHR(display, EGL_NO_CONTEXT, EGL_NATIVE_PIXMAP_KHR, (EGLNativePixmapType)&pixmap, NULL);
 
         if (image == EGL_NO_IMAGE_KHR) {
-                printf("failed to create DMA pixmap %x\n",eglGetError());
-                return -1;
+          printf("failed to create DMA pixmap %x\n",eglGetError());
+          return -1;
         }
 #endif
     }
     return 0;
+fail:
+   ump_close();
+   munmap(mem, mem_size);
+   return -1;
 }
 
